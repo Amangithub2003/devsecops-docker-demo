@@ -1,10 +1,15 @@
-// Jenkinsfile — implements:
-// Git checkout -> Maven build/test -> SonarQube -> SAST/Dependency scan ->
-// Docker build -> Trivy scan -> Push to Nexus/Artifactory ->
-// Deploy via Docker Compose over SSH (no Kubernetes)
+// Jenkinsfile — single-VM version.
+// Jenkins, Docker, and the deployed app all live on the same RHEL host,
+// so there's no registry push and no SSH deploy step: Jenkins builds the
+// image locally and runs `docker compose up -d` directly.
 
 pipeline {
   agent any
+
+  tools {
+    maven 'Maven3'   // name must match Manage Jenkins > Tools > Maven installations
+    jdk 'jdk17'      // name must match Manage Jenkins > Tools > JDK installations
+  }
 
   options {
     timestamps()
@@ -13,12 +18,9 @@ pipeline {
   }
 
   environment {
-    APP_NAME        = 'demo-app'
-    DOCKER_REGISTRY = 'nexus.example.com:5000'
-    IMAGE_NAME      = "${DOCKER_REGISTRY}/${APP_NAME}"
-    IMAGE_TAG       = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7) ?: 'local'}"
-    SONAR_HOST_URL  = 'http://sonarqube.example.com:9000'
-    DEPLOY_HOST     = 'demo-app.example.com'   // EC2 host from terraform/outputs.tf
+    APP_NAME       = 'demo-app'
+    IMAGE_TAG      = "${env.BUILD_NUMBER}"
+    SONAR_HOST_URL = 'http://localhost:9000'
   }
 
   stages {
@@ -81,7 +83,7 @@ pipeline {
     stage('Docker Build') {
       steps {
         dir('app') {
-          sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:latest ."
+          sh "docker build -t ${APP_NAME}:${IMAGE_TAG} -t ${APP_NAME}:latest ."
         }
       }
     }
@@ -93,41 +95,24 @@ pipeline {
             --severity HIGH,CRITICAL \
             --exit-code 1 \
             --format table \
-            ${IMAGE_NAME}:${IMAGE_TAG}
+            ${APP_NAME}:${IMAGE_TAG}
         """
       }
     }
 
-    stage('Push to Nexus/Artifactory') {
+    stage('Deploy (local Docker Compose)') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'nexus-docker-creds',
-                                           usernameVariable: 'REG_USER',
-                                           passwordVariable: 'REG_PASS')]) {
-          sh """
-            echo "\$REG_PASS" | docker login ${DOCKER_REGISTRY} -u "\$REG_USER" --password-stdin
-            docker push ${IMAGE_NAME}:${IMAGE_TAG}
-            docker push ${IMAGE_NAME}:latest
-          """
-        }
-      }
-    }
-
-    stage('Deploy (Docker Compose over SSH)') {
-      steps {
-        withCredentials([sshUserPrivateKey(credentialsId: 'app-host-ssh-key',
-                                            keyFileVariable: 'SSH_KEY')]) {
-          sh "./deploy/deploy.sh ${DEPLOY_HOST} \$SSH_KEY ${IMAGE_TAG}"
-        }
+        sh 'docker compose up -d'
       }
     }
   }
 
   post {
     success {
-      echo "Pipeline succeeded: ${IMAGE_NAME}:${IMAGE_TAG} deployed to ${DEPLOY_HOST}."
+      echo "Pipeline succeeded: ${APP_NAME}:${IMAGE_TAG} built and deployed locally."
     }
     failure {
-      echo "Pipeline failed — check the stage above. Nothing was deployed."
+      echo "Pipeline failed — check the stage above. Nothing was (re)deployed."
     }
   }
 }
