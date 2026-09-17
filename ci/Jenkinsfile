@@ -1,0 +1,133 @@
+// Jenkinsfile — implements:
+// Git checkout -> Maven build/test -> SonarQube -> SAST/Dependency scan ->
+// Docker build -> Trivy scan -> Push to Nexus/Artifactory ->
+// Deploy via Docker Compose over SSH (no Kubernetes)
+
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
+  environment {
+    APP_NAME        = 'demo-app'
+    DOCKER_REGISTRY = 'nexus.example.com:5000'
+    IMAGE_NAME      = "${DOCKER_REGISTRY}/${APP_NAME}"
+    IMAGE_TAG       = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7) ?: 'local'}"
+    SONAR_HOST_URL  = 'http://sonarqube.example.com:9000'
+    DEPLOY_HOST     = 'demo-app.example.com'   // EC2 host from terraform/outputs.tf
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Build & Unit Test (Maven)') {
+      steps {
+        dir('app') {
+          sh 'mvn -B clean verify'
+        }
+      }
+      post {
+        always {
+          junit 'app/target/surefire-reports/*.xml'
+          jacoco execPattern: 'app/target/jacoco.exec'
+        }
+      }
+    }
+
+    stage('SonarQube Static Analysis') {
+      steps {
+        dir('app') {
+          withSonarQubeEnv('sonarqube-server') {
+            sh """
+              mvn -B sonar:sonar \
+                -Dsonar.projectKey=${APP_NAME} \
+                -Dsonar.host.url=${SONAR_HOST_URL}
+            """
+          }
+        }
+      }
+    }
+
+    stage('Quality Gate') {
+      steps {
+        timeout(time: 10, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+
+    stage('SAST / Dependency Scan') {
+      steps {
+        dir('app') {
+          sh 'mvn -B dependency-check:check'
+        }
+      }
+      post {
+        always {
+          dependencyCheckPublisher pattern: 'app/target/dependency-check-report.xml'
+        }
+      }
+    }
+
+    stage('Docker Build') {
+      steps {
+        dir('app') {
+          sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:latest ."
+        }
+      }
+    }
+
+    stage('Trivy Image Scan') {
+      steps {
+        sh """
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --format table \
+            ${IMAGE_NAME}:${IMAGE_TAG}
+        """
+      }
+    }
+
+    stage('Push to Nexus/Artifactory') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'nexus-docker-creds',
+                                           usernameVariable: 'REG_USER',
+                                           passwordVariable: 'REG_PASS')]) {
+          sh """
+            echo "\$REG_PASS" | docker login ${DOCKER_REGISTRY} -u "\$REG_USER" --password-stdin
+            docker push ${IMAGE_NAME}:${IMAGE_TAG}
+            docker push ${IMAGE_NAME}:latest
+          """
+        }
+      }
+    }
+
+    stage('Deploy (Docker Compose over SSH)') {
+      steps {
+        withCredentials([sshUserPrivateKey(credentialsId: 'app-host-ssh-key',
+                                            keyFileVariable: 'SSH_KEY')]) {
+          sh "./deploy/deploy.sh ${DEPLOY_HOST} \$SSH_KEY ${IMAGE_TAG}"
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Pipeline succeeded: ${IMAGE_NAME}:${IMAGE_TAG} deployed to ${DEPLOY_HOST}."
+    }
+    failure {
+      echo "Pipeline failed — check the stage above. Nothing was deployed."
+    }
+  }
+}

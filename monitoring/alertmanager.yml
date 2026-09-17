@@ -1,0 +1,16 @@
+route:
+  receiver: default-receiver
+  routes:
+    - match:
+        severity: critical
+      receiver: pagerduty-critical
+
+receivers:
+  - name: default-receiver
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/REPLACE/ME"
+        channel: "#demo-app-alerts"
+
+  - name: pagerduty-critical
+    pagerduty_configs:
+      - service_key: "<PAGERDUTY_SERVICE_KEY>"
